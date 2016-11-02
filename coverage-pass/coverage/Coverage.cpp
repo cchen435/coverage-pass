@@ -16,7 +16,8 @@ namespace {
 
     const int width = 10;
 
-    struct Coverage : public FunctionPass {
+    class Coverage : public FunctionPass {
+    public:
         static char ID;
         Coverage() : FunctionPass(ID) { }
         bool runOnFunction(Function &F) override;
@@ -24,9 +25,11 @@ namespace {
             AU.setPreservesCFG();
         }
 
+    private:
         void initialize(IList InstList, CMap &map);
         void print(CMap map);
         void print(VList list);
+        VList minimalSet(CMap Map, VList FullSet);
         void concatenate(CMap &map);
     };
 }
@@ -36,29 +39,30 @@ static RegisterPass<Coverage> X("coverage", "Coverage of each variable inside a 
                                 false /* Only looks at CFG */,
                                 false /* Analysis Pass */);
 
-
 bool Coverage::runOnFunction(Function &F)
 {
     CMap CoverageSets;
 
     /* storing unprocessed Instructions */
     IList WorkList;
+    VList FullSet; // storing global variables' definitions
 
     /* initialize WorkList with all Instructions */
     for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i)
         WorkList.push_back(&*i);
 
 
-    DEBUG_WITH_TYPE("Coverage", errs()<<"Function: " << F.getName() << "\n");
     initialize(WorkList, CoverageSets);
 
+    errs()<<"Function: " << F.getName() << "\n";
     DEBUG_WITH_TYPE("Coverage", errs() << "before concatenation:\n");
     DEBUG_WITH_TYPE("Coverage", print(CoverageSets));
     DEBUG_WITH_TYPE("Coverage", errs() << "After concatenation:\n");
     concatenate(CoverageSets);
+
     print(CoverageSets);
     errs() << "\n";
-
+    minimalSet(CoverageSets, FullSet);
 }
 
 // initializing the map. For each instruction, it will create a key:value pair
@@ -96,8 +100,22 @@ void Coverage::initialize(IList InstList, CMap &map) {
 
         // Memory Access and Addressing: alloca, load (done), store (done), fence, cmpxchg, atomicrmw, getelementptr
         if (isa<AllocaInst>(I) || isa<FenceInst>(I) || isa<AtomicCmpXchgInst>(I)
-            || isa<AtomicRMWInst>(I) || isa<GetElementPtrInst>(I) || isa<LoadInst>(I)) {
+            || isa<AtomicRMWInst>(I) || isa<LoadInst>(I)) {
             DEBUG_WITH_TYPE("Coverage", errs() << "Skipping: " << I->getOpcodeName() << "\n");
+            continue;
+        }
+
+        // this is trying to handle GetElementPtrInst, what is the difference between struct and array
+        if (isa<GetElementPtrInst>(I)) {
+            /*
+            errs() << I->getName() << ": \n";
+            for (Instruction::op_iterator OI = I->op_begin(), OE = I->op_end(); OI != OE; OI++) {
+                if (Value *V = dyn_cast<Value>(OI)) {
+                    V->getType()-> dump();
+                    errs() <<"\n";
+                }
+            }
+            */
             continue;
         }
 
@@ -213,6 +231,12 @@ void Coverage::concatenate(CMap &map) {
 
 }
 
+VList Coverage::minimalSet(CMap Map, VList FullSet) {
+    for (CMap::iterator it = Map.begin(), et = Map.end(); it != et; it++) {
+    }
+    return VList();
+}
+
 void Coverage::print(CMap map) {
     int pos = 0;
     for (CMap::iterator MB = map.begin(), ME = map.end(); MB != ME; MB++) {
@@ -223,14 +247,8 @@ void Coverage::print(CMap map) {
         errs() << "[" << key->getName() << "] covers: \n";
         for (VList::iterator si = set.begin(), se = set.end(); si != se; si++) {
             errs() << "[" << (*si)->getName() << "]";
-            /*
-            errs() << "[";
-            (*si)->print(errs());
-            errs() << "]";
-             */
             if ((si + 1) != se)
                 errs() << ",";
-
             pos++;
             if (pos % width == 0) {
                 pos = 0;
