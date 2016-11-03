@@ -55,9 +55,9 @@ bool Coverage::runOnFunction(Function &F)
     }
 
 
+    errs()<<"Function: " << F.getName() << "\n";
     initialize(WorkList, CoverageSets);
 
-    errs()<<"Function: " << F.getName() << "\n";
     DEBUG_WITH_TYPE("Coverage", errs() << "before concatenation:\n");
     DEBUG_WITH_TYPE("Coverage", print(CoverageSets));
     DEBUG_WITH_TYPE("Coverage", errs() << "After concatenation:\n");
@@ -103,19 +103,22 @@ void Coverage::initialize(IList InstList, CMap &map) {
             continue;
         }
 
-        // Memory Access and Addressing: alloca, load (done), store (done), fence, cmpxchg, atomicrmw, getelementptr
+        // Memory Access and Addressing: alloca, load (done), store (done), fence, cmpxchg, atomicrmw
         if (isa<AllocaInst>(I) || isa<FenceInst>(I) || isa<AtomicCmpXchgInst>(I)
                 || isa<AtomicRMWInst>(I)) {
             DEBUG_WITH_TYPE("Coverage", errs() << "Skipping: " << I->getOpcodeName() << "\n");
             continue;
         }
 
-        // this is trying to handle GetElementPtrInst, what is the difference between struct and array
+        // this is trying to handle GetElementPtrInst.
+        // Currently, we just treat its definition is the same to its base operand.
+        // This could be helpful for array, but struct may need some different way.
         if ( isa<GetElementPtrInst>(I) ) {
             Value *op = I->getOperand(0);
             equalMap[V] = op;
             continue;
         }
+
         if (isa<LoadInst>(I)) {
             Value *op = I->getOperand(0);
             equalMap[V] = op;
@@ -128,6 +131,13 @@ void Coverage::initialize(IList InstList, CMap &map) {
             Value *dst = I->getOperand(1);
             Value *src = I->getOperand(0);
 
+            //errs() << "Instruction: \n";
+            //I->dump();
+            //errs() << "operand type: ";
+            //dst->getType()->dump();
+            //errs() << " is a instruction: " << isa<Instruction>(dst);
+            //errs() << "\n\n\n";
+
             // first time to use the map element, need to initialize (allocate memory for) it.
             if (map.find(dst) == map.end()) {
                 map[dst] = VList();
@@ -137,7 +147,7 @@ void Coverage::initialize(IList InstList, CMap &map) {
         }
 
         // handle sextInst
-        if (isa<SExtInst>(I)) {
+        if (isa<SExtInst>(I) || isa<BitCastInst>(I)) {
             Value *op = I->getOperand(0);
             equalMap[V] = op;
             continue;
@@ -150,12 +160,30 @@ void Coverage::initialize(IList InstList, CMap &map) {
         }
 
         // after inline, it may only include intrinsic and library APIs, skip temporary
+        //handle intrinsic function call, e.g. llvm.memcpy.p0i8
         // ToDo: handle CallInst better if it is out of assumption
         if (isa<CallInst>(I)) {
-            DEBUG_WITH_TYPE("Coverage", errs() << "Skipping: " << I->getOpcodeName() << "\n");
+            StringRef prefix = StringRef("llvm.memcpy");
+            CallInst * CI = dyn_cast<CallInst>(I);
+            Function *cf = CI->getCalledFunction();
+            //errs() << "Called function: " << cf->getName() << "\n";
+            if (cf->getName().startswith_lower(prefix)) {
+                //errs() << "Processing function: " << cf->getName() << "\n";
+                Value * dst = CI->getArgOperand(0);
+                Value * src = CI->getArgOperand(1);
+                //errs() << "dst: ";
+                //dst->print(errs());
+                //errs() << "\nsrc: ";
+                //src->print(errs());
+                //errs() << "\n";
+
+                if (map.find(dst) == map.end()) {
+                    map[dst] = VList();
+                }
+                map[dst].push_back(src);
+            }
             continue;
         }
-
 
         // Other misc operations: landingpad, va_arg, select, call. phi, fcmp and icmp are treated as normal
         if (isa<LandingPadInst>(I) || isa<VAArgInst>(I) || isa<SelectInst>(I)) {
@@ -175,21 +203,30 @@ void Coverage::initialize(IList InstList, CMap &map) {
         // iterate over each operand in the instruction
         for (Instruction::op_iterator OI = I->op_begin(), OE = I->op_end(); OI != OE; OI++) {
             if (isa<Constant>(OI)) { // operand is a constant
-                DEBUG_WITH_TYPE("Coverage", errs() << "Skipping Constant:");
+                DEBUG_WITH_TYPE("Coverage", errs() << "Instruction: " << I->getName() << " Skipping Constant:");
                 DEBUG_WITH_TYPE("Coverage", dyn_cast<Constant>(OI)->dump());
                 continue;
             }
             // Operand is a LoadInst, we treat load definition equal to its operand.
             map[V].push_back(dyn_cast<Value>(OI));
-
-            if (Instruction *op = dyn_cast<Instruction>(OI)) {
-                WorkList.push_back(op);
-            }
         }
 
         // make sure current Instruction is removed from the WorkList
         WorkList.erase(std::remove(WorkList.begin(), WorkList.end(), I), WorkList.end());
     }
+
+    //errs() << "equal map: \n";
+    //for (std::map<Value *, Value *>::iterator it = equalMap.begin(), et = equalMap.end(); it != et; it++) {
+    //    errs() << "[";
+    //    it->first->print(errs());
+    //    errs() << "] maps to [";
+    //    it->second->print(errs());
+    //    errs() << "]\n";
+    //}
+
+    //errs() << "map before replacing: \n";
+    //print(map);
+    //errs() << "---------------------\n";
 
     // replace instruction according to equalMap
     while(changed) {
@@ -197,8 +234,14 @@ void Coverage::initialize(IList InstList, CMap &map) {
         VList ToRemove;
         for (CMap::iterator MB = map.begin(), ME = map.end(); MB != ME; MB++) {
             Value *key = MB->first;
+            // key is replaceable
             if (equalMap.find(key) != equalMap.end()) {
-                std::swap(map[equalMap[key]], MB->second);
+                // if the key to be replaced with has been already in map
+                if (map.find(equalMap[key]) != map.end()) {
+                    map[equalMap[key]].insert(map[equalMap[key]].end(), (MB->second).begin(), (MB->second).end());
+                } else { // key not in the map
+                    std::swap(map[equalMap[key]], MB->second);
+                }
                 map.erase(key);
                 key = equalMap[key];
                 changed = true;
@@ -217,6 +260,9 @@ void Coverage::initialize(IList InstList, CMap &map) {
         }
 
     }
+    //errs() << "\n\nmap after replacing: \n";
+    //print(map);
+    //errs() << "---------------------\n";
 }
 
 // This function is to concatenate the coverage map. If the key of a set is in others values vector,
@@ -295,9 +341,22 @@ void Coverage::print(CMap map) {
         Value *key = MB->first;
         std::vector<Value *> set = MB->second;
 
-        errs() << "[" << key->getName() << "] covers: \n";
+        if (key->hasName()) {
+            errs() << "[" << key->getName() << "] covers: \n";
+        } else {
+            errs() << "[";
+            key->print(errs());
+            errs() << "] covers: \n";
+
+        }
         for (VList::iterator si = set.begin(), se = set.end(); si != se; si++) {
-            errs() << "[" << (*si)->getName() << "]";
+            if ((*si)->hasName())
+                errs() << "[" << (*si)->getName() << "]";
+            else {
+                errs() << "[";
+                (*si)->print(errs());
+                errs() << "]";
+            }
             if ((si + 1) != se)
                 errs() << ",";
             pos++;
