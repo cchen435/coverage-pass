@@ -1,3 +1,4 @@
+#include <vector>
 #include "llvm/Pass.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -17,39 +18,41 @@ namespace {
     const int width = 10;
 
     class Coverage : public FunctionPass {
-    public:
-        static char ID;
-        Coverage() : FunctionPass(ID) { }
-        bool runOnFunction(Function &F) override;
-        void getAnalysisUsage(AnalysisUsage &AU) {
-            AU.setPreservesCFG();
-        }
+        public:
+            static char ID;
+            Coverage() : FunctionPass(ID) { }
+            bool runOnFunction(Function &F) override;
+            void getAnalysisUsage(AnalysisUsage &AU) {
+                AU.setPreservesCFG();
+            }
 
-    private:
-        void initialize(IList InstList, CMap &map);
-        void print(CMap map);
-        void print(VList list);
-        VList minimalSet(CMap Map, VList FullSet);
-        void concatenate(CMap &map);
+        private:
+            void initialize(IList InstList, CMap &map);
+            void print(CMap map);
+            void print(VList list);
+            VList minimalSet(CMap Map, VList FullSet);
+            void concatenate(CMap &map, IList ordered);
     };
 }
 
 char Coverage::ID = 0;
 static RegisterPass<Coverage> X("coverage", "Coverage of each variable inside a Function",
-                                false /* Only looks at CFG */,
-                                false /* Analysis Pass */);
+        false /* Only looks at CFG */,
+        false /* Analysis Pass */);
 
 bool Coverage::runOnFunction(Function &F)
 {
     CMap CoverageSets;
 
     /* storing unprocessed Instructions */
-    IList WorkList;
+    IList WorkList, Ordered;
     VList FullSet; // storing global variables' definitions
 
     /* initialize WorkList with all Instructions */
-    for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i)
+    for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i){
         WorkList.push_back(&*i);
+        Ordered.push_back(&*i);
+    }
 
 
     initialize(WorkList, CoverageSets);
@@ -58,7 +61,7 @@ bool Coverage::runOnFunction(Function &F)
     DEBUG_WITH_TYPE("Coverage", errs() << "before concatenation:\n");
     DEBUG_WITH_TYPE("Coverage", print(CoverageSets));
     DEBUG_WITH_TYPE("Coverage", errs() << "After concatenation:\n");
-    concatenate(CoverageSets);
+    concatenate(CoverageSets, Ordered);
 
     print(CoverageSets);
     errs() << "\n";
@@ -70,6 +73,8 @@ bool Coverage::runOnFunction(Function &F)
 void Coverage::initialize(IList InstList, CMap &map) {
 
     IList WorkList = InstList;
+    std::map<Value *, Value *> equalMap;
+    int changed = true;
 
     /* Loop over the WorkList to processing each instruction */
     while (!WorkList.empty()) {
@@ -100,22 +105,20 @@ void Coverage::initialize(IList InstList, CMap &map) {
 
         // Memory Access and Addressing: alloca, load (done), store (done), fence, cmpxchg, atomicrmw, getelementptr
         if (isa<AllocaInst>(I) || isa<FenceInst>(I) || isa<AtomicCmpXchgInst>(I)
-            || isa<AtomicRMWInst>(I) || isa<LoadInst>(I)) {
+                || isa<AtomicRMWInst>(I)) {
             DEBUG_WITH_TYPE("Coverage", errs() << "Skipping: " << I->getOpcodeName() << "\n");
             continue;
         }
 
         // this is trying to handle GetElementPtrInst, what is the difference between struct and array
-        if (isa<GetElementPtrInst>(I)) {
-            /*
-            errs() << I->getName() << ": \n";
-            for (Instruction::op_iterator OI = I->op_begin(), OE = I->op_end(); OI != OE; OI++) {
-                if (Value *V = dyn_cast<Value>(OI)) {
-                    V->getType()-> dump();
-                    errs() <<"\n";
-                }
-            }
-            */
+        if ( isa<GetElementPtrInst>(I) ) {
+            Value *op = I->getOperand(0);
+            equalMap[V] = op;
+            continue;
+        }
+        if (isa<LoadInst>(I)) {
+            Value *op = I->getOperand(0);
+            equalMap[V] = op;
             continue;
         }
 
@@ -130,6 +133,13 @@ void Coverage::initialize(IList InstList, CMap &map) {
                 map[dst] = VList();
             }
             map[dst].push_back(src);
+            continue;
+        }
+
+        // handle sextInst
+        if (isa<SExtInst>(I)) {
+            Value *op = I->getOperand(0);
+            equalMap[V] = op;
             continue;
         }
 
@@ -170,11 +180,7 @@ void Coverage::initialize(IList InstList, CMap &map) {
                 continue;
             }
             // Operand is a LoadInst, we treat load definition equal to its operand.
-            if (LoadInst *op = dyn_cast<LoadInst>(OI)) {
-                map[V].push_back(dyn_cast<Value>(op->getOperand(0)));
-            } else {
-                map[V].push_back(dyn_cast<Value>(OI));
-            }
+            map[V].push_back(dyn_cast<Value>(OI));
 
             if (Instruction *op = dyn_cast<Instruction>(OI)) {
                 WorkList.push_back(op);
@@ -184,56 +190,101 @@ void Coverage::initialize(IList InstList, CMap &map) {
         // make sure current Instruction is removed from the WorkList
         WorkList.erase(std::remove(WorkList.begin(), WorkList.end(), I), WorkList.end());
     }
+
+    // replace instruction according to equalMap
+    while(changed) {
+        changed = false;
+        VList ToRemove;
+        for (CMap::iterator MB = map.begin(), ME = map.end(); MB != ME; MB++) {
+            Value *key = MB->first;
+            if (equalMap.find(key) != equalMap.end()) {
+                std::swap(map[equalMap[key]], MB->second);
+                map.erase(key);
+                key = equalMap[key];
+                changed = true;
+            }
+            for(VList::iterator VB = map[key].begin(), VE = map[key].end(); VB != VE; VB++) {
+               if (equalMap.find(*VB) != equalMap.end()) {
+                   ToRemove.push_back(*VB);
+                   map[key].push_back(equalMap[*VB]);
+                   changed = true;
+               }
+            }
+            for (VList::iterator VB = ToRemove.begin(), VE = ToRemove.end(); VB != VE; VB++) {
+                map[key].erase(std::remove(map[key].begin(), map[key].end(), *VB), map[key].end());
+            }
+            ToRemove.clear();
+        }
+
+    }
 }
 
 // This function is to concatenate the coverage map. If the key of a set is in others values vector,
 // It will be appended to the end of that vector
-void Coverage::concatenate(CMap &map) {
+void Coverage::concatenate(CMap &map, IList ordered) {
     VList ToRemove;
     VList ToAppend;
     bool changed = true;
 
     while(changed) {
         changed = false;
+        IList tmp = ordered;
+        while(!tmp.empty()) {
+            Instruction *I = tmp.back();
+            Value *key = dyn_cast<Value>(I);
+            tmp.pop_back();
 
-        for (CMap::iterator MB = map.begin(), ME = map.end(); MB != ME; MB++) {
-            Value *key = MB->first;
-            // remove duplicates
-            std::sort(map[key].begin(), map[key].end());
-            map[key].erase(std::unique(map[key].begin(), map[key].end()), map[key].end());
+            if (isa<StoreInst>(I)) {
+                key = dyn_cast<Value>(I->getOperand(1));
+            }
+
+            if (map.find(key) == map.end()) continue;
+            // if instruction has been marked as to be removed, skip it
+            if ( std::find(ToRemove.begin(), ToRemove.end(), key) != ToRemove.end() ) continue;
 
             // iterate over each element to check whether it is also a key in the map
             // if yes concatenate that set to the end and mark it to be removed
-            for (VList::iterator LI = map[key].begin(), LE = map[key].end(); LI != LE; LI++) {
-                if (map.find((*LI)) != map.end()) {
+            for ( VList::iterator LI = map[key].begin(), LE = map[key].end(); LI != LE; LI++) {
+                if (map.find((*LI)) != map.end() && *LI != key) {
                     ToAppend.insert(ToAppend.end(), map[*LI].begin(), map[*LI].end());
                     ToRemove.push_back(*LI);
                     changed = true;
                 }
             }
             // append to the end
+            DEBUG_WITH_TYPE("Coverage", std::sort(ToAppend.begin(), ToAppend.end()));
+            DEBUG_WITH_TYPE("Coverage", ToAppend.erase(std::unique(ToAppend.begin(), ToAppend.end()), ToAppend.end()));
             map[key].insert(map[key].end(), ToAppend.begin(), ToAppend.end());
+            
+            DEBUG_WITH_TYPE("Coverage", errs() << "Append to [" << key->getName() << "]: "); 
+            DEBUG_WITH_TYPE("Coverage", print(ToAppend));
+            ToAppend.clear();
+            // remove duplicates
+            std::sort(map[key].begin(), map[key].end() );
+            map[key].erase(std::unique(map[key].begin(), map[key].end()), map[key].end());
         }
 
         //remove those has been concatenated
-        for (VList::iterator LI = ToRemove.begin(), LE = ToRemove.end(); LI != LE; LI++)
+        for ( VList::iterator LI = ToRemove.begin(), LE = ToRemove.end(); LI != LE; LI++) {
             map.erase(*LI);
+        }
+        DEBUG_WITH_TYPE("Coverage", errs() << "to Remove:"); 
+        DEBUG_WITH_TYPE("Coverage", print(ToRemove));
         ToRemove.clear();
     }
 
     // remove duplicates
-    for (CMap::iterator MB = map.begin(), ME = map.end(); MB != ME; MB++) {
+    for ( CMap::iterator MB = map.begin(), ME = map.end(); MB != ME; MB++) {
         Value *key = MB->first;
         std::sort(map[key].begin(), map[key].end());
         map[key].erase(std::unique(map[key].begin(), map[key].end()), map[key].end());
-
     }
-
 }
 
+
+
 VList Coverage::minimalSet(CMap Map, VList FullSet) {
-    for (CMap::iterator it = Map.begin(), et = Map.end(); it != et; it++) {
-    }
+    for (CMap::iterator it = Map.begin(), et = Map.end(); it != et; it++);
     return VList();
 }
 
@@ -272,4 +323,5 @@ void Coverage::print(VList list) {
             errs() << "\n";
         }
     }
+    errs() << "\n";
 }
